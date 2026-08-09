@@ -2,7 +2,6 @@ services:
 
   postgres:
     image: pgvector/pgvector:pg16
-
     container_name: weather-rag-postgres
 
     restart: unless-stopped
@@ -27,6 +26,36 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: weather-rag-api
+
+    restart: unless-stopped
+
+    environment:
+      DATABASE_BACKEND: local
+      DATABASE_URL: postgresql://weather_user:weather_password@postgres:5432/weather_rag
+
+      OLLAMA_HOST: http://host.docker.internal:11434
+      WEATHER_LLM_MODEL: llama3.2:1b
+
+      FLASK_RUN_HOST: 0.0.0.0
+      FLASK_RUN_PORT: 8000
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 
 volumes:
