@@ -64,6 +64,7 @@ def geocode_location(
         "format": "json",
         "limit": 1,
         "countrycodes": "in",
+        "addressdetails": 1,
     }
 
     headers = {
@@ -91,6 +92,96 @@ def geocode_location(
         float(result["lon"]),
         result.get("display_name", location),
     )
+
+
+def geocode_location_details(
+    location: str,
+) -> Optional[Dict]:
+    """
+    Resolve an Indian location and return structured geographic
+    and administrative metadata.
+
+    Returns:
+
+        {
+            "latitude": float,
+            "longitude": float,
+            "display_name": str,
+            "state": str | None,
+            "district": str | None,
+        }
+    """
+
+    location = location.strip()
+
+    # Direct coordinates
+    if "," in location:
+        parts = [part.strip() for part in location.split(",")]
+
+        if len(parts) == 2:
+            try:
+                latitude = float(parts[0])
+                longitude = float(parts[1])
+
+                if (
+                    -90 <= latitude <= 90
+                    and -180 <= longitude <= 180
+                ):
+                    return {
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "display_name": location,
+                        "state": None,
+                        "district": None,
+                    }
+
+            except ValueError:
+                pass
+
+    params = {
+        "q": f"{location}, India",
+        "format": "json",
+        "limit": 1,
+        "countrycodes": "in",
+        "addressdetails": 1,
+    }
+
+    headers = {
+        "User-Agent": USER_AGENT,
+    }
+
+    response = requests.get(
+        NOMINATIM_URL,
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    results = response.json()
+
+    if not results:
+        return None
+
+    result = results[0]
+
+    address = result.get("address", {})
+
+    return {
+        "latitude": float(result["lat"]),
+        "longitude": float(result["lon"]),
+        "display_name": result.get(
+            "display_name",
+            location,
+        ),
+        "state": address.get("state"),
+        "district": (
+            address.get("state_district")
+            or address.get("district")
+            or address.get("county")
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -197,20 +288,54 @@ WEATHER_CODES = {
 }
 
 
-def weather_description(code: Optional[int]) -> str:
-    """Convert Open-Meteo WMO weather code to readable text."""
+def weather_description(
+    code: Optional[int],
+) -> str:
+    """
+    Convert Open-Meteo WMO weather code to readable text.
+    """
 
     if code is None:
         return "Unknown"
 
-    return WEATHER_CODES.get(code, "Unknown weather condition")
+    return WEATHER_CODES.get(
+        code,
+        "Unknown weather condition",
+    )
+
+
+def weather_severity(
+    code: Optional[int],
+) -> str:
+    """
+    Classify weather conditions into application-level severity.
+
+    This is NOT an official IMD warning classification.
+    """
+
+    if code is None:
+        return "unknown"
+
+    if code in {95, 96, 99}:
+        return "severe"
+
+    if code in {65, 67, 82, 86}:
+        return "high"
+
+    if code in {61, 63, 80, 81}:
+        return "moderate"
+
+    return "normal"
 
 
 # ---------------------------------------------------------------------------
 # Stable document IDs
 # ---------------------------------------------------------------------------
 
-def _make_id(prefix: str, raw: Dict) -> str:
+def _make_id(
+    prefix: str,
+    raw: Dict,
+) -> str:
     """
     Create a deterministic document ID.
 
@@ -232,20 +357,86 @@ def _make_id(prefix: str, raw: Dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Normalization
+# Normalization helpers
+# ---------------------------------------------------------------------------
+
+def _get_index(
+    values: Optional[List],
+    index: int,
+):
+    """
+    Safely retrieve a list value.
+    """
+
+    if not values or index >= len(values):
+        return None
+
+    return values[index]
+
+
+# ---------------------------------------------------------------------------
+# Current weather normalization
 # ---------------------------------------------------------------------------
 
 def normalize_current_weather(
     weather: Dict,
     location_label: str,
+    location_details: Optional[Dict] = None,
 ) -> Dict:
     """
-    Convert current Open-Meteo weather into a RAG document.
+    Convert current Open-Meteo weather into a structured RAG document.
     """
 
-    current = weather.get("current", {})
+    current = weather.get(
+        "current",
+        {},
+    )
 
-    weather_code = current.get("weather_code")
+    weather_code = current.get(
+        "weather_code"
+    )
+
+    latitude = (
+        location_details.get("latitude")
+        if location_details
+        else None
+    )
+
+    longitude = (
+        location_details.get("longitude")
+        if location_details
+        else None
+    )
+
+    state = (
+        location_details.get("state")
+        if location_details
+        else None
+    )
+
+    district = (
+        location_details.get("district")
+        if location_details
+        else None
+    )
+
+    current_time = current.get(
+        "time"
+    )
+
+    forecast_date = (
+        current_time[:10]
+        if current_time
+        else None
+    )
+
+    severity = weather_severity(
+        weather_code
+    )
+
+    condition = weather_description(
+        weather_code
+    )
 
     headline = (
         f"Current weather in {location_label}"
@@ -253,48 +444,112 @@ def normalize_current_weather(
 
     narrative = (
         f"Current weather for {location_label}. "
-        f"Temperature: {current.get('temperature_2m')} °C. "
-        f"Feels like: {current.get('apparent_temperature')} °C. "
-        f"Humidity: {current.get('relative_humidity_2m')}%. "
-        f"Condition: {weather_description(weather_code)}. "
-        f"Precipitation: {current.get('precipitation')} mm. "
-        f"Cloud cover: {current.get('cloud_cover')}%. "
-        f"Wind speed: {current.get('wind_speed_10m')} km/h. "
-        f"Wind direction: {current.get('wind_direction_10m')}°."
+        f"State: {state or 'Unknown'}. "
+        f"District: {district or 'Unknown'}. "
+        f"Temperature: "
+        f"{current.get('temperature_2m')} °C. "
+        f"Feels like: "
+        f"{current.get('apparent_temperature')} °C. "
+        f"Humidity: "
+        f"{current.get('relative_humidity_2m')}%. "
+        f"Condition: {condition}. "
+        f"Severity: {severity}. "
+        f"Precipitation: "
+        f"{current.get('precipitation')} mm. "
+        f"Cloud cover: "
+        f"{current.get('cloud_cover')}%. "
+        f"Wind speed: "
+        f"{current.get('wind_speed_10m')} km/h. "
+        f"Wind direction: "
+        f"{current.get('wind_direction_10m')}°."
     )
 
     raw = {
         "location": location_label,
         "source": "open-meteo",
         "type": "current",
-        "time": current.get("time"),
+        "time": current_time,
     }
 
     return {
-        "id": _make_id("current", raw),
+        "id": _make_id(
+            "current",
+            raw,
+        ),
         "location": location_label,
+        "state": state,
+        "district": district,
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": "open-meteo",
         "source_type": "current",
         "headline": headline,
         "narrative_text": narrative,
-        "issued_at": current.get("time"),
+        "forecast_date": forecast_date,
+        "temperature_min_c": None,
+        "temperature_max_c": current.get(
+            "temperature_2m"
+        ),
+        "rainfall_mm": current.get(
+            "precipitation"
+        ),
+        "precipitation_probability": None,
+        "weather_code": weather_code,
+        "severity": severity,
+        "issued_at": current_time,
         "payload": weather,
         "synced_at": None,
     }
 
 
+# ---------------------------------------------------------------------------
+# Daily forecast normalization
+# ---------------------------------------------------------------------------
+
 def normalize_daily_forecasts(
     weather: Dict,
     location_label: str,
+    location_details: Optional[Dict] = None,
 ) -> List[Dict]:
     """
-    Convert daily Open-Meteo forecasts into individual RAG documents.
+    Convert daily Open-Meteo forecasts into structured RAG documents.
     """
 
-    daily = weather.get("daily", {})
+    daily = weather.get(
+        "daily",
+        {},
+    )
 
-    dates = daily.get("time", [])
+    dates = daily.get(
+        "time",
+        [],
+    )
 
     documents = []
+
+    latitude = (
+        location_details.get("latitude")
+        if location_details
+        else None
+    )
+
+    longitude = (
+        location_details.get("longitude")
+        if location_details
+        else None
+    )
+
+    state = (
+        location_details.get("state")
+        if location_details
+        else None
+    )
+
+    district = (
+        location_details.get("district")
+        if location_details
+        else None
+    )
 
     for index, date in enumerate(dates):
 
@@ -324,7 +579,9 @@ def normalize_daily_forecasts(
         )
 
         precipitation_probability = _get_index(
-            daily.get("precipitation_probability_max"),
+            daily.get(
+                "precipitation_probability_max"
+            ),
             index,
         )
 
@@ -333,22 +590,38 @@ def normalize_daily_forecasts(
             index,
         )
 
-        condition = weather_description(weather_code)
+        condition = weather_description(
+            weather_code
+        )
+
+        severity = weather_severity(
+            weather_code
+        )
 
         headline = (
-            f"Weather forecast for {location_label} on {date}"
+            f"Weather forecast for "
+            f"{location_label} on {date}"
         )
 
         narrative = (
-            f"Weather forecast for {location_label} on {date}. "
+            f"Weather forecast for "
+            f"{location_label} on {date}. "
+            f"State: {state or 'Unknown'}. "
+            f"District: {district or 'Unknown'}. "
             f"Condition: {condition}. "
-            f"Minimum temperature: {min_temp} °C. "
-            f"Maximum temperature: {max_temp} °C. "
-            f"Total precipitation: {precipitation} mm. "
-            f"Rainfall: {rain} mm. "
+            f"Severity: {severity}. "
+            f"Minimum temperature: "
+            f"{min_temp} °C. "
+            f"Maximum temperature: "
+            f"{max_temp} °C. "
+            f"Total precipitation: "
+            f"{precipitation} mm. "
+            f"Rainfall: "
+            f"{rain} mm. "
             f"Maximum precipitation probability: "
             f"{precipitation_probability}%. "
-            f"Maximum wind speed: {wind} km/h."
+            f"Maximum wind speed: "
+            f"{wind} km/h."
         )
 
         raw = {
@@ -359,11 +632,28 @@ def normalize_daily_forecasts(
 
         documents.append(
             {
-                "id": _make_id("forecast", raw),
+                "id": _make_id(
+                    "forecast",
+                    raw,
+                ),
                 "location": location_label,
+                "state": state,
+                "district": district,
+                "latitude": latitude,
+                "longitude": longitude,
+                "source": "open-meteo",
                 "source_type": "forecast",
                 "headline": headline,
                 "narrative_text": narrative,
+                "forecast_date": date,
+                "temperature_min_c": min_temp,
+                "temperature_max_c": max_temp,
+                "rainfall_mm": rain,
+                "precipitation_probability": (
+                    precipitation_probability
+                ),
+                "weather_code": weather_code,
+                "severity": severity,
                 "issued_at": date,
                 "payload": {
                     "date": date,
@@ -373,7 +663,9 @@ def normalize_daily_forecasts(
                     "temperature_max_c": max_temp,
                     "precipitation_mm": precipitation,
                     "rain_mm": rain,
-                    "precipitation_probability": precipitation_probability,
+                    "precipitation_probability": (
+                        precipitation_probability
+                    ),
                     "max_wind_speed_kmh": wind,
                 },
                 "synced_at": None,
@@ -381,18 +673,6 @@ def normalize_daily_forecasts(
         )
 
     return documents
-
-
-def _get_index(
-    values: Optional[List],
-    index: int,
-):
-    """Safely retrieve a list value."""
-
-    if not values or index >= len(values):
-        return None
-
-    return values[index]
 
 
 # ---------------------------------------------------------------------------
@@ -404,8 +684,13 @@ def upsert_documents(
 ) -> int:
     """
     Upsert normalized weather documents into PostgreSQL/Lakebase.
+
+    Lakebase is imported lazily so weather API functionality can be
+    tested locally without Databricks credentials.
     """
+
     import lakebase
+
     if not documents:
         return 0
 
@@ -413,9 +698,21 @@ def upsert_documents(
         INSERT INTO weather_documents (
             id,
             location,
+            state,
+            district,
+            latitude,
+            longitude,
+            source,
             source_type,
             headline,
             narrative_text,
+            forecast_date,
+            temperature_min_c,
+            temperature_max_c,
+            rainfall_mm,
+            precipitation_probability,
+            weather_code,
+            severity,
             issued_at,
             payload,
             synced_at
@@ -428,14 +725,39 @@ def upsert_documents(
             %s,
             %s,
             %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
             now()
         )
         ON CONFLICT (id)
         DO UPDATE SET
             location = EXCLUDED.location,
+            state = EXCLUDED.state,
+            district = EXCLUDED.district,
+            latitude = EXCLUDED.latitude,
+            longitude = EXCLUDED.longitude,
+            source = EXCLUDED.source,
             source_type = EXCLUDED.source_type,
             headline = EXCLUDED.headline,
             narrative_text = EXCLUDED.narrative_text,
+            forecast_date = EXCLUDED.forecast_date,
+            temperature_min_c = EXCLUDED.temperature_min_c,
+            temperature_max_c = EXCLUDED.temperature_max_c,
+            rainfall_mm = EXCLUDED.rainfall_mm,
+            precipitation_probability =
+                EXCLUDED.precipitation_probability,
+            weather_code = EXCLUDED.weather_code,
+            severity = EXCLUDED.severity,
             issued_at = EXCLUDED.issued_at,
             payload = EXCLUDED.payload,
             synced_at = now()
@@ -444,13 +766,31 @@ def upsert_documents(
     params = []
 
     for document in documents:
+
         params.append(
             (
                 document.get("id"),
                 document.get("location"),
+                document.get("state"),
+                document.get("district"),
+                document.get("latitude"),
+                document.get("longitude"),
+                document.get(
+                    "source",
+                    "open-meteo",
+                ),
                 document.get("source_type"),
                 document.get("headline"),
                 document.get("narrative_text"),
+                document.get("forecast_date"),
+                document.get("temperature_min_c"),
+                document.get("temperature_max_c"),
+                document.get("rainfall_mm"),
+                document.get(
+                    "precipitation_probability"
+                ),
+                document.get("weather_code"),
+                document.get("severity"),
                 document.get("issued_at"),
                 json.dumps(
                     document.get("payload") or {},
@@ -460,6 +800,7 @@ def upsert_documents(
         )
 
     with lakebase.get_connection() as connection:
+
         with connection.cursor() as cursor:
 
             cursor.executemany(
@@ -494,15 +835,33 @@ def sync_locations(
     for location in locations:
 
         try:
-            resolved = geocode_location(location)
 
-            if not resolved:
-                print(
-                    f"Could not resolve location: {location}"
+            location_details = (
+                geocode_location_details(
+                    location
                 )
+            )
+
+            if not location_details:
+
+                print(
+                    f"Could not resolve location: "
+                    f"{location}"
+                )
+
                 continue
 
-            latitude, longitude, label = resolved
+            latitude = location_details[
+                "latitude"
+            ]
+
+            longitude = location_details[
+                "longitude"
+            ]
+
+            label = location_details[
+                "display_name"
+            ]
 
             print(
                 f"Fetching weather for {label} "
@@ -520,6 +879,7 @@ def sync_locations(
                 normalize_current_weather(
                     weather,
                     label,
+                    location_details,
                 )
             )
 
@@ -527,15 +887,19 @@ def sync_locations(
                 normalize_daily_forecasts(
                     weather,
                     label,
+                    location_details,
                 )
             )
 
-            count = upsert_documents(documents)
+            count = upsert_documents(
+                documents
+            )
 
             total += count
 
             print(
-                f"Synced {count} documents for {label}"
+                f"Synced {count} documents "
+                f"for {label}"
             )
 
         except requests.RequestException as exc:
@@ -553,6 +917,8 @@ def sync_locations(
             )
 
         # Respect Nominatim/Open-Meteo usage.
-        time.sleep(LOCATION_DELAY_SECONDS)
+        time.sleep(
+            LOCATION_DELAY_SECONDS
+        )
 
     return total
