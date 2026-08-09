@@ -52,9 +52,9 @@ def test_weather_ask_empty_query():
     data = response.get_json()
 
     assert (
-        data["error"]
-        == "Query cannot be empty"
-    )
+    data["error"]
+    == "Missing or invalid 'query' in request body"
+)
 
 
 def test_weather_ask_invalid_top_k():
