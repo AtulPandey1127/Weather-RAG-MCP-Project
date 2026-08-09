@@ -17,8 +17,6 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-import lakebase
-
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -407,7 +405,7 @@ def upsert_documents(
     """
     Upsert normalized weather documents into PostgreSQL/Lakebase.
     """
-
+    import lakebase
     if not documents:
         return 0
 
