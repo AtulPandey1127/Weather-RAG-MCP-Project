@@ -1,69 +1,145 @@
 """
-RAG service for weather question answering.
+Hybrid RAG service for Indian weather question answering.
 
 Pipeline:
 
 query
-  -> embedding
+  -> query embedding
   -> vector retrieval
+  -> BM25 retrieval
+  -> Reciprocal Rank Fusion
   -> context construction
-  -> LLM
+  -> local Ollama LLM
   -> grounded answer + citations
+
+No paid LLM API is required.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 from typing import Any
 
-from openai import OpenAI
+import ollama
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 import lakebase
 
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 EMBEDDING_MODEL = os.environ.get(
     "WEATHER_EMBEDDING_MODEL",
     "sentence-transformers/all-MiniLM-L6-v2",
 )
 
-LLM_MODEL = os.environ.get(
+OLLAMA_MODEL = os.environ.get(
     "WEATHER_LLM_MODEL",
-    "gpt-5-mini",
+    "llama3.2:3b",
 )
 
-DEFAULT_TOP_K = int(os.environ.get("WEATHER_RAG_TOP_K", "5"))
+DEFAULT_TOP_K = int(
+    os.environ.get(
+        "WEATHER_RAG_TOP_K",
+        "5",
+    )
+)
 
-_embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-_openai_client = OpenAI()
+VECTOR_CANDIDATES = int(
+    os.environ.get(
+        "WEATHER_VECTOR_CANDIDATES",
+        "20",
+    )
+)
+
+BM25_CANDIDATES = int(
+    os.environ.get(
+        "WEATHER_BM25_CANDIDATES",
+        "20",
+    )
+)
+
+BM25_CORPUS_LIMIT = int(
+    os.environ.get(
+        "WEATHER_BM25_CORPUS_LIMIT",
+        "5000",
+    )
+)
+
+RRF_K = int(
+    os.environ.get(
+        "WEATHER_RRF_K",
+        "60",
+    )
+)
 
 
-def embed_query(query: str) -> list[float]:
-    """Convert the user's question into the same vector space as documents."""
+# ---------------------------------------------------------------------------
+# Embedding model
+# ---------------------------------------------------------------------------
+
+_embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL
+)
+
+
+# ---------------------------------------------------------------------------
+# Query embedding
+# ---------------------------------------------------------------------------
+
+def embed_query(
+    query: str,
+) -> list[float]:
+    """
+    Convert a user query into the embedding space used by weather documents.
+    """
 
     vector = _embedding_model.encode(
         [query],
         show_progress_bar=False,
     )[0]
 
-    return [float(value) for value in vector]
+    return [
+        float(value)
+        for value in vector
+    ]
 
 
-def retrieve_weather(
+# ---------------------------------------------------------------------------
+# Vector retrieval
+# ---------------------------------------------------------------------------
+
+def retrieve_vector(
     query: str,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: int = VECTOR_CANDIDATES,
 ) -> list[dict[str, Any]]:
     """
-    Retrieve the most semantically relevant weather chunks.
+    Retrieve semantically similar weather chunks using pgvector.
     """
 
-    top_k = max(1, min(20, int(top_k)))
+    top_k = max(
+        1,
+        min(
+            100,
+            int(top_k),
+        ),
+    )
 
     vector = embed_query(query)
 
     vector_literal = (
         "["
-        + ",".join(repr(float(value)) for value in vector)
+        + ",".join(
+            repr(float(value))
+            for value in vector
+        )
         + "]"
     )
 
@@ -71,28 +147,50 @@ def retrieve_weather(
         SELECT
             d.id AS document_id,
             d.location,
+            d.state,
+            d.district,
+            d.source,
             d.source_type,
             d.headline,
+            d.forecast_date,
+            d.temperature_min_c,
+            d.temperature_max_c,
+            d.rainfall_mm,
+            d.precipitation_probability,
+            d.weather_code,
+            d.severity,
             d.issued_at,
             e.chunk_index,
             e.chunk_text,
-            (e.embedding <=> %s::vector) AS distance
+            (
+                e.embedding <=> %s::vector
+            ) AS distance
+
         FROM weather_embeddings e
+
         JOIN weather_documents d
             ON d.id = e.document_id
+
         ORDER BY distance ASC
+
         LIMIT %s
     """
 
     rows = lakebase.run_query(
         sql,
-        (vector_literal, top_k),
+        (
+            vector_literal,
+            top_k,
+        ),
     )
 
     results = []
 
     for row in rows:
-        distance = row.get("distance")
+
+        distance = row.get(
+            "distance"
+        )
 
         similarity = (
             None
@@ -102,13 +200,7 @@ def retrieve_weather(
 
         results.append(
             {
-                "document_id": row.get("document_id"),
-                "location": row.get("location"),
-                "source_type": row.get("source_type"),
-                "headline": row.get("headline"),
-                "issued_at": row.get("issued_at"),
-                "chunk_index": row.get("chunk_index"),
-                "chunk_text": row.get("chunk_text"),
+                **row,
                 "similarity": similarity,
             }
         )
@@ -116,34 +208,403 @@ def retrieve_weather(
     return results
 
 
+# ---------------------------------------------------------------------------
+# BM25 retrieval
+# ---------------------------------------------------------------------------
+
+def _tokenize(
+    text: str,
+) -> list[str]:
+    """
+    Lightweight tokenizer for BM25.
+    """
+
+    return [
+        token.lower()
+        for token in text.split()
+        if token.strip()
+    ]
+
+
+def retrieve_bm25(
+    query: str,
+    limit: int = BM25_CANDIDATES,
+) -> list[dict[str, Any]]:
+    """
+    Retrieve keyword-relevant weather chunks using BM25.
+
+    The current implementation builds the BM25 index from a bounded
+    corpus loaded from PostgreSQL. This is suitable for the project's
+    current weather-scale dataset.
+
+    For very large datasets, this should later be replaced with a
+    PostgreSQL-native full-text retrieval layer.
+    """
+
+    corpus_sql = """
+        SELECT
+            d.id AS document_id,
+            d.location,
+            d.state,
+            d.district,
+            d.source,
+            d.source_type,
+            d.headline,
+            d.forecast_date,
+            d.temperature_min_c,
+            d.temperature_max_c,
+            d.rainfall_mm,
+            d.precipitation_probability,
+            d.weather_code,
+            d.severity,
+            d.issued_at,
+            e.chunk_index,
+            e.chunk_text
+
+        FROM weather_embeddings e
+
+        JOIN weather_documents d
+            ON d.id = e.document_id
+
+        ORDER BY d.forecast_date DESC NULLS LAST
+
+        LIMIT %s
+    """
+
+    rows = lakebase.run_query(
+        corpus_sql,
+        (
+            BM25_CORPUS_LIMIT,
+        ),
+    )
+
+    if not rows:
+        return []
+
+    corpus = []
+
+    for row in rows:
+
+        text = " ".join(
+            [
+                str(
+                    row.get("location")
+                    or ""
+                ),
+                str(
+                    row.get("state")
+                    or ""
+                ),
+                str(
+                    row.get("district")
+                    or ""
+                ),
+                str(
+                    row.get("headline")
+                    or ""
+                ),
+                str(
+                    row.get("source_type")
+                    or ""
+                ),
+                str(
+                    row.get("severity")
+                    or ""
+                ),
+                str(
+                    row.get("chunk_text")
+                    or ""
+                ),
+            ]
+        )
+
+        corpus.append(
+            _tokenize(text)
+        )
+
+    if not corpus:
+        return []
+
+    bm25 = BM25Okapi(
+        corpus
+    )
+
+    query_tokens = _tokenize(
+        query
+    )
+
+    scores = bm25.get_scores(
+        query_tokens
+    )
+
+    ranked_indices = sorted(
+        range(len(scores)),
+        key=lambda index: scores[index],
+        reverse=True,
+    )
+
+    results = []
+
+    for index in ranked_indices:
+
+        if len(results) >= limit:
+            break
+
+        score = float(
+            scores[index]
+        )
+
+        # Don't return completely unrelated documents.
+        if score <= 0:
+            continue
+
+        row = dict(
+            rows[index]
+        )
+
+        row["bm25_score"] = score
+
+        results.append(
+            row
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Reciprocal Rank Fusion
+# ---------------------------------------------------------------------------
+
+def reciprocal_rank_fusion(
+    vector_results: list[dict[str, Any]],
+    bm25_results: list[dict[str, Any]],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """
+    Combine vector and BM25 rankings using Reciprocal Rank Fusion.
+
+    RRF score:
+
+        score(d) =
+            1 / (k + rank_vector)
+            +
+            1 / (k + rank_bm25)
+
+    Documents appearing in both rankings receive stronger scores.
+    """
+
+    fused: dict[str, dict[str, Any]] = {}
+
+    # Vector ranking
+    for rank, document in enumerate(
+        vector_results,
+        start=1,
+    ):
+
+        document_id = document.get(
+            "document_id"
+        )
+
+        if not document_id:
+            continue
+
+        if document_id not in fused:
+
+            fused[document_id] = {
+                **document,
+                "vector_rank": None,
+                "bm25_rank": None,
+                "rrf_score": 0.0,
+            }
+
+        fused[
+            document_id
+        ]["vector_rank"] = rank
+
+        fused[
+            document_id
+        ]["rrf_score"] += (
+            1.0
+            / (RRF_K + rank)
+        )
+
+    # BM25 ranking
+    for rank, document in enumerate(
+        bm25_results,
+        start=1,
+    ):
+
+        document_id = document.get(
+            "document_id"
+        )
+
+        if not document_id:
+            continue
+
+        if document_id not in fused:
+
+            fused[document_id] = {
+                **document,
+                "vector_rank": None,
+                "bm25_rank": None,
+                "rrf_score": 0.0,
+            }
+
+        fused[
+            document_id
+        ]["bm25_rank"] = rank
+
+        fused[
+            document_id
+        ]["rrf_score"] += (
+            1.0
+            / (RRF_K + rank)
+        )
+
+    results = sorted(
+        fused.values(),
+        key=lambda item: item[
+            "rrf_score"
+        ],
+        reverse=True,
+    )
+
+    return results[
+        :max(
+            1,
+            min(
+                20,
+                int(top_k),
+            ),
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval
+# ---------------------------------------------------------------------------
+
+def retrieve_weather(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[dict[str, Any]]:
+    """
+    Hybrid weather retrieval.
+
+    Combines:
+
+        1. Dense vector similarity
+        2. BM25 lexical retrieval
+        3. Reciprocal Rank Fusion
+    """
+
+    top_k = max(
+        1,
+        min(
+            20,
+            int(top_k),
+        ),
+    )
+
+    vector_results = retrieve_vector(
+        query,
+        VECTOR_CANDIDATES,
+    )
+
+    bm25_results = retrieve_bm25(
+        query,
+        BM25_CANDIDATES,
+    )
+
+    results = reciprocal_rank_fusion(
+        vector_results,
+        bm25_results,
+        top_k,
+    )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Context construction
+# ---------------------------------------------------------------------------
+
 def build_context(
     documents: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[
+    str,
+    list[dict[str, Any]],
+]:
     """
     Convert retrieved documents into an LLM context block.
-
-    Returns:
-        context text
-        source metadata
     """
 
     context_parts = []
+
     sources = []
 
-    for index, document in enumerate(documents, start=1):
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
 
         citation_id = f"S{index}"
 
-        location = document.get("location") or "Unknown location"
-        headline = document.get("headline") or "Weather information"
-        source_type = document.get("source_type") or "unknown"
-        chunk_text = document.get("chunk_text") or ""
+        location = (
+            document.get("location")
+            or "Unknown location"
+        )
+
+        state = (
+            document.get("state")
+            or "Unknown state"
+        )
+
+        district = (
+            document.get("district")
+            or "Unknown district"
+        )
+
+        headline = (
+            document.get("headline")
+            or "Weather information"
+        )
+
+        source = (
+            document.get("source")
+            or "unknown"
+        )
+
+        source_type = (
+            document.get("source_type")
+            or "unknown"
+        )
+
+        forecast_date = (
+            document.get("forecast_date")
+            or "unknown"
+        )
+
+        severity = (
+            document.get("severity")
+            or "unknown"
+        )
+
+        chunk_text = (
+            document.get("chunk_text")
+            or ""
+        )
 
         context_parts.append(
             f"""
 [{citation_id}]
 Location: {location}
+State: {state}
+District: {district}
+Source: {source}
 Source type: {source_type}
+Forecast date: {forecast_date}
+Severity: {severity}
 Headline: {headline}
 
 Weather information:
@@ -154,37 +615,75 @@ Weather information:
         sources.append(
             {
                 "citation": citation_id,
-                "document_id": document.get("document_id"),
+                "document_id": document.get(
+                    "document_id"
+                ),
                 "location": location,
+                "state": state,
+                "district": district,
+                "source": source,
                 "source_type": source_type,
-                "headline": headline,
-                "similarity": document.get("similarity"),
+                "forecast_date": forecast_date,
+                "severity": severity,
+                "similarity": document.get(
+                    "similarity"
+                ),
+                "bm25_score": document.get(
+                    "bm25_score"
+                ),
+                "rrf_score": document.get(
+                    "rrf_score"
+                ),
             }
         )
 
-    return "\n\n---\n\n".join(context_parts), sources
+    return (
+        "\n\n---\n\n".join(
+            context_parts
+        ),
+        sources,
+    )
 
+
+# ---------------------------------------------------------------------------
+# Grounded generation
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """
-You are a weather intelligence assistant.
+You are an Indian weather intelligence assistant.
 
-Your job is to answer questions using ONLY the weather information
+Answer questions using ONLY the weather information
 provided in the retrieved context.
 
 Rules:
 
 1. Do not invent weather facts.
-2. Do not use outside knowledge to fill missing weather information.
-3. If the retrieved context does not contain enough information,
-   explicitly say that the available weather data is insufficient.
-4. Cite factual claims using the source identifiers provided in the
-   context, for example [S1] or [S2].
-5. Prefer the most relevant and recent information when multiple
-   sources disagree.
-6. Distinguish between forecasts and active weather alerts.
-7. Do not claim that weather information is live unless the retrieved
-   data indicates that it is current.
-8. Keep the answer concise but useful.
+
+2. Do not use outside knowledge to fill missing
+   weather information.
+
+3. If the retrieved context is insufficient,
+   explicitly say that the available weather data
+   is insufficient.
+
+4. Cite factual claims using source identifiers such
+   as [S1], [S2], etc.
+
+5. Prefer recent information when multiple weather
+   records are available.
+
+6. Clearly distinguish current conditions from forecasts.
+
+7. Do not describe an Open-Meteo condition severity as
+   an official government warning.
+
+8. Do not claim that a condition is an official IMD
+   warning unless the retrieved source explicitly says so.
+
+9. Keep answers concise and useful.
+
+10. Use Celsius and kilometres per hour unless the
+    retrieved data specifies otherwise.
 """
 
 
@@ -193,7 +692,9 @@ def generate_answer(
     context: str,
 ) -> str:
     """
-    Generate a grounded answer from retrieved weather context.
+    Generate a grounded answer using a local Ollama model.
+
+    No paid API key is required.
     """
 
     user_prompt = f"""
@@ -205,29 +706,50 @@ Retrieved weather context:
 
 {context}
 
-Answer the user's question using only this context.
-Include citations such as [S1] and [S2] for factual claims.
+Answer the user's question using ONLY the retrieved
+weather context.
+
+Include citations such as [S1] and [S2].
 """
 
-    response = _openai_client.responses.create(
-        model=LLM_MODEL,
-        instructions=SYSTEM_PROMPT,
-        input=user_prompt,
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
     )
 
-    return response.output_text.strip()
+    return response[
+        "message"
+    ][
+        "content"
+    ].strip()
 
+
+# ---------------------------------------------------------------------------
+# Complete RAG pipeline
+# ---------------------------------------------------------------------------
 
 def answer_weather_question(
     query: str,
     top_k: int = DEFAULT_TOP_K,
 ) -> dict[str, Any]:
     """
-    Complete RAG pipeline.
+    Execute the complete hybrid RAG pipeline.
     """
 
     if not query or not query.strip():
-        raise ValueError("Query cannot be empty.")
+
+        raise ValueError(
+            "Query cannot be empty."
+        )
 
     query = query.strip()
 
@@ -237,17 +759,22 @@ def answer_weather_question(
     )
 
     if not documents:
+
         return {
             "answer": (
-                "I could not find relevant weather information "
-                "in the knowledge base."
+                "I could not find relevant "
+                "weather information in the "
+                "knowledge base."
             ),
             "sources": [],
             "retrieved_documents": 0,
-            "model": LLM_MODEL,
+            "model": OLLAMA_MODEL,
+            "retrieval": "hybrid",
         }
 
-    context, sources = build_context(documents)
+    context, sources = build_context(
+        documents
+    )
 
     answer = generate_answer(
         query=query,
@@ -257,6 +784,9 @@ def answer_weather_question(
     return {
         "answer": answer,
         "sources": sources,
-        "retrieved_documents": len(documents),
-        "model": LLM_MODEL,
+        "retrieved_documents": len(
+            documents
+        ),
+        "model": OLLAMA_MODEL,
+        "retrieval": "hybrid",
     }
