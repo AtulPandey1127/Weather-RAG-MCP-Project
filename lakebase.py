@@ -1,10 +1,25 @@
 """
-Lakebase (Databricks-managed Postgres) connection helper.
+Database connection helper.
 
-Databricks authentication is initialized lazily so that the application
-can start locally without Lakebase credentials.
+Supports two backends:
 
-Lakebase credentials are only required when a database operation is used.
+1. Local PostgreSQL + pgvector
+   Used for development and testing.
+
+2. Databricks Lakebase
+   Used for managed/production deployment.
+
+Backend selection:
+
+    DATABASE_BACKEND=local
+        -> DATABASE_URL
+
+    DATABASE_BACKEND=lakebase
+        -> Databricks secret
+
+Local default:
+
+    postgresql://weather_user:weather_password@localhost:5432/weather_rag
 """
 
 from __future__ import annotations
@@ -14,17 +29,33 @@ import os
 from contextlib import contextmanager
 
 import psycopg
-from databricks.sdk import WorkspaceClient
 from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 
 
-_SCOPE = os.environ.get(
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DATABASE_BACKEND = os.environ.get(
+    "DATABASE_BACKEND",
+    "local",
+).lower()
+
+
+LOCAL_DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://weather_user:weather_password@localhost:5432/weather_rag",
+)
+
+
+LAKEBASE_SECRET_SCOPE = os.environ.get(
     "LAKEBASE_SECRET_SCOPE",
     "database",
 )
 
-_KEY = os.environ.get(
+
+LAKEBASE_SECRET_KEY = os.environ.get(
     "LAKEBASE_SECRET_KEY",
     "lakebase-url",
 )
@@ -34,18 +65,22 @@ _KEY = os.environ.get(
 # Lazy Databricks client
 # ---------------------------------------------------------------------------
 
-_workspace_client: WorkspaceClient | None = None
+_workspace_client = None
 
 
-def _get_workspace_client() -> WorkspaceClient:
+def _get_workspace_client():
     """
-    Create the Databricks WorkspaceClient only when Lakebase access
-    is actually required.
+    Lazily create the Databricks WorkspaceClient.
+
+    This is intentionally NOT executed when lakebase.py is imported.
     """
 
     global _workspace_client
 
     if _workspace_client is None:
+
+        from databricks.sdk import WorkspaceClient
+
         _workspace_client = WorkspaceClient()
 
     return _workspace_client
@@ -55,21 +90,53 @@ def _get_workspace_client() -> WorkspaceClient:
 # Lakebase URL
 # ---------------------------------------------------------------------------
 
-def _lakebase_url() -> str:
+def _get_lakebase_url() -> str:
     """
-    Fetch and decode the Lakebase connection URL from Databricks secrets.
+    Fetch the Lakebase PostgreSQL URL from Databricks secrets.
     """
 
-    workspace_client = _get_workspace_client()
+    workspace_client = (
+        _get_workspace_client()
+    )
 
-    secret = workspace_client.secrets.get_secret(
-        scope=_SCOPE,
-        key=_KEY,
+    secret = (
+        workspace_client
+        .secrets
+        .get_secret(
+            scope=LAKEBASE_SECRET_SCOPE,
+            key=LAKEBASE_SECRET_KEY,
+        )
     )
 
     return base64.b64decode(
         secret.value
-    ).decode("utf-8")
+    ).decode(
+        "utf-8"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Database URL
+# ---------------------------------------------------------------------------
+
+def get_database_url() -> str:
+    """
+    Return the active database connection URL.
+    """
+
+    if DATABASE_BACKEND == "local":
+
+        return LOCAL_DATABASE_URL
+
+    if DATABASE_BACKEND == "lakebase":
+
+        return _get_lakebase_url()
+
+    raise ValueError(
+        "Unsupported DATABASE_BACKEND: "
+        f"{DATABASE_BACKEND}. "
+        "Use 'local' or 'lakebase'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -79,30 +146,57 @@ def _lakebase_url() -> str:
 @contextmanager
 def get_connection():
     """
-    Yield a PostgreSQL connection.
-
-    Databricks authentication is triggered only when this function
-    is actually called.
+    Yield a PostgreSQL connection using dict rows.
     """
 
-    conn = psycopg.connect(
-        _lakebase_url(),
+    connection = psycopg.connect(
+        get_database_url(),
         row_factory=dict_row,
     )
 
     try:
-        yield conn
-    finally:
-        conn.close()
 
+        yield connection
+
+    finally:
+
+        connection.close()
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy engine
+# ---------------------------------------------------------------------------
 
 def get_engine():
     """
-    Return a SQLAlchemy engine for Lakebase.
+    Return a SQLAlchemy engine for the active database.
     """
 
+    database_url = get_database_url()
+
+    # SQLAlchemy's psycopg driver.
+    if database_url.startswith(
+        "postgresql://"
+    ):
+
+        database_url = database_url.replace(
+            "postgresql://",
+            "postgresql+psycopg://",
+            1,
+        )
+
+    elif database_url.startswith(
+        "postgres://"
+    ):
+
+        database_url = database_url.replace(
+            "postgres://",
+            "postgresql+psycopg://",
+            1,
+        )
+
     return create_engine(
-        _lakebase_url()
+        database_url
     )
 
 
@@ -115,19 +209,19 @@ def run_query(
     params: tuple | dict | None = None,
 ) -> list[dict]:
     """
-    Execute a read query.
+    Execute a SELECT query and return rows as dictionaries.
     """
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cur:
+        with connection.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 sql,
                 params,
             )
 
-            return cur.fetchall()
+            return cursor.fetchall()
 
 
 def run_write(
@@ -135,21 +229,45 @@ def run_write(
     params: tuple | dict | None = None,
 ) -> int:
     """
-    Execute an INSERT/UPDATE/DELETE/DDL statement.
+    Execute an INSERT, UPDATE, DELETE, or DDL statement.
     """
 
-    with get_connection() as conn:
+    with get_connection() as connection:
 
-        with conn.cursor() as cur:
+        with connection.cursor() as cursor:
 
-            cur.execute(
+            cursor.execute(
                 sql,
                 params,
             )
 
-            conn.commit()
+            connection.commit()
 
-            return cur.rowcount
+            return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Database health
+# ---------------------------------------------------------------------------
+
+def check_connection() -> bool:
+    """
+    Check whether the configured database is reachable.
+    """
+
+    with get_connection() as connection:
+
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                "SELECT 1"
+            )
+
+            result = cursor.fetchone()
+
+            return bool(
+                result
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -160,14 +278,22 @@ def ensure_weather_tables(
     embedding_dim: int = 384,
 ) -> None:
     """
-    Create the weather tables and indexes.
-
-    This function requires working Lakebase credentials.
+    Create the weather tables, indexes, and pgvector index.
     """
 
+    # -----------------------------------------------------------------------
+    # pgvector
+    # -----------------------------------------------------------------------
+
     run_write(
-        "CREATE EXTENSION IF NOT EXISTS vector;"
+        """
+        CREATE EXTENSION IF NOT EXISTS vector;
+        """
     )
+
+    # -----------------------------------------------------------------------
+    # Weather documents
+    # -----------------------------------------------------------------------
 
     run_write(
         """
@@ -185,7 +311,8 @@ def ensure_weather_tables(
 
             longitude DOUBLE PRECISION,
 
-            source TEXT NOT NULL DEFAULT 'open-meteo',
+            source TEXT NOT NULL
+                DEFAULT 'open-meteo',
 
             source_type TEXT NOT NULL,
 
@@ -201,7 +328,8 @@ def ensure_weather_tables(
 
             rainfall_mm DOUBLE PRECISION,
 
-            precipitation_probability DOUBLE PRECISION,
+            precipitation_probability
+                DOUBLE PRECISION,
 
             weather_code INTEGER,
 
@@ -211,7 +339,8 @@ def ensure_weather_tables(
 
             payload JSONB NOT NULL,
 
-            synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            synced_at TIMESTAMPTZ
+                NOT NULL DEFAULT now()
         )
         """
     )
@@ -220,7 +349,7 @@ def ensure_weather_tables(
     # Existing-table migrations
     # -----------------------------------------------------------------------
 
-    migration_columns = [
+    migrations = [
         (
             "state",
             "TEXT",
@@ -271,7 +400,7 @@ def ensure_weather_tables(
         ),
     ]
 
-    for column_name, column_type in migration_columns:
+    for column_name, column_type in migrations:
 
         run_write(
             f"""
@@ -282,7 +411,7 @@ def ensure_weather_tables(
         )
 
     # -----------------------------------------------------------------------
-    # Weather indexes
+    # Weather document indexes
     # -----------------------------------------------------------------------
 
     indexes = [
@@ -331,7 +460,7 @@ def ensure_weather_tables(
         )
 
     # -----------------------------------------------------------------------
-    # Embeddings
+    # Weather embeddings
     # -----------------------------------------------------------------------
 
     run_write(
@@ -346,20 +475,28 @@ def ensure_weather_tables(
 
             chunk_text TEXT NOT NULL,
 
-            embedding VECTOR({embedding_dim}) NOT NULL,
+            embedding VECTOR({embedding_dim})
+                NOT NULL,
 
             model_name TEXT NOT NULL,
 
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            created_at TIMESTAMPTZ
+                NOT NULL DEFAULT now()
         )
         """
     )
+
+    # -----------------------------------------------------------------------
+    # Embedding indexes
+    # -----------------------------------------------------------------------
 
     run_write(
         """
         CREATE INDEX IF NOT EXISTS
         idx_weather_embeddings_document_id
-        ON weather_embeddings (document_id)
+        ON weather_embeddings (
+            document_id
+        )
         """
     )
 
@@ -373,3 +510,42 @@ def ensure_weather_tables(
         )
         """
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    print(
+        "Database backend:",
+        DATABASE_BACKEND,
+    )
+
+    print(
+        "Database URL:",
+        (
+            "configured"
+            if DATABASE_BACKEND == "lakebase"
+            else LOCAL_DATABASE_URL
+        ),
+    )
+
+    try:
+
+        if check_connection():
+
+            print(
+                "Database connection: OK"
+            )
+
+    except Exception as exc:
+
+        print(
+            "Database connection: FAILED"
+        )
+
+        print(
+            exc
+        )
