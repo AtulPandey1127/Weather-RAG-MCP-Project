@@ -91,6 +91,43 @@ def sync_news_from_massive():
 
 @app.route("/weather/search", methods=["POST"])
 def weather_search():
+@app.route("/weather/ask", methods=["POST"])
+def weather_ask():
+    body = request.json if request.is_json else {}
+
+    query = body.get("query")
+
+    if not query or not isinstance(query, str):
+        return jsonify(
+            {"error": "Missing or invalid 'query' in request body"}
+        ), 400
+
+    try:
+        top_k = int(body.get("top_k", 5))
+    except (TypeError, ValueError):
+        return jsonify(
+            {"error": "'top_k' must be an integer"}
+        ), 400
+
+    top_k = max(1, min(20, top_k))
+
+    try:
+        result = rag_service.answer_weather_question(
+            query=query,
+            top_k=top_k,
+        )
+
+        return jsonify(result)
+
+    except Exception as exc:
+        logger.exception("Weather RAG request failed")
+
+        return jsonify(
+            {
+                "error": "Failed to generate weather answer",
+                "details": str(exc),
+            }
+        ), 500
     """Semantic search over ingested weather documents.
 
     Body: {"query": "flash flood risk this weekend", "limit": 5}
