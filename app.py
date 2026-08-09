@@ -2,16 +2,28 @@
 Indian Weather RAG API.
 
 Provides:
+
     GET  /healthz
     POST /weather/ask
     POST /weather/sync
 
-The application uses:
-    - Open-Meteo for weather data
-    - Nominatim for location resolution
-    - Lakebase/PostgreSQL for persistence
-    - pgvector + BM25 for hybrid retrieval
-    - Ollama for local LLM generation
+Architecture:
+
+    Open-Meteo
+        ↓
+    weather_client
+        ↓
+    Lakebase / PostgreSQL
+        ↓
+    Hybrid RAG
+        ├── pgvector
+        └── BM25
+        ↓
+    RRF
+        ↓
+    Ollama
+        ↓
+    Grounded answer
 
 No paid LLM API is required.
 """
@@ -29,7 +41,7 @@ import weather_client
 
 
 # ---------------------------------------------------------------------------
-# Application
+# Logging
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -40,13 +52,18 @@ logger = logging.getLogger(
     "weather-rag"
 )
 
+
+# ---------------------------------------------------------------------------
+# Flask application
+# ---------------------------------------------------------------------------
+
 app = Flask(
     __name__
 )
 
 
 # ---------------------------------------------------------------------------
-# Health
+# Health check
 # ---------------------------------------------------------------------------
 
 @app.route(
@@ -56,6 +73,10 @@ app = Flask(
 def healthz():
     """
     Basic application health check.
+
+    This endpoint does NOT access Lakebase or Databricks.
+    Therefore it can be used to verify that the application
+    starts locally without database credentials.
     """
 
     return jsonify(
@@ -89,11 +110,14 @@ def weather_ask():
 
         {
             "answer": "...",
-            "sources": [...],
+            "sources": [],
             "retrieved_documents": 5,
             "model": "llama3.2:3b",
             "retrieval": "hybrid"
         }
+
+    This endpoint requires the weather database and embeddings
+    to be available.
     """
 
     body = (
@@ -194,7 +218,7 @@ def weather_ask():
 
 
 # ---------------------------------------------------------------------------
-# Weather ingestion
+# Weather synchronization
 # ---------------------------------------------------------------------------
 
 @app.route(
@@ -214,6 +238,8 @@ def weather_sync():
                 "Mumbai"
             ]
         }
+
+    This endpoint requires Lakebase credentials.
     """
 
     body = (
@@ -273,7 +299,8 @@ def weather_sync():
 
     try:
 
-        # Ensure database schema exists.
+        # Database initialization is intentionally
+        # performed only when the sync endpoint is called.
         lakebase.ensure_weather_tables(
             embedding_dim=384
         )
@@ -313,13 +340,13 @@ def weather_sync():
 
 
 # ---------------------------------------------------------------------------
-# Error handling
+# 404 handler
 # ---------------------------------------------------------------------------
 
 @app.errorhandler(404)
 def not_found(error):
     """
-    Return JSON instead of Flask's HTML 404 page.
+    Return JSON for unknown endpoints.
     """
 
     return jsonify(
@@ -329,10 +356,14 @@ def not_found(error):
     ), 404
 
 
+# ---------------------------------------------------------------------------
+# 405 handler
+# ---------------------------------------------------------------------------
+
 @app.errorhandler(405)
 def method_not_allowed(error):
     """
-    Return JSON instead of Flask's HTML 405 page.
+    Return JSON for unsupported HTTP methods.
     """
 
     return jsonify(
@@ -341,6 +372,10 @@ def method_not_allowed(error):
         }
     ), 405
 
+
+# ---------------------------------------------------------------------------
+# Global error handler
+# ---------------------------------------------------------------------------
 
 @app.errorhandler(Exception)
 def handle_exception(error):
@@ -361,7 +396,7 @@ def handle_exception(error):
 
 
 # ---------------------------------------------------------------------------
-# Local execution
+# Local development
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
