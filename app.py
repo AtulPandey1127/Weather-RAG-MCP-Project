@@ -1,222 +1,385 @@
 """
-Databricks App boilerplate:
-- Serves a small Flask API
-- Reads/writes to Lakebase (Databricks-managed Postgres) via lakebase.py
-- Pulls data from the Massive API via massive_client.py and syncs it into Lakebase
+Indian Weather RAG API.
 
-Run locally:
-    python app.py
-Deploy as a Databricks App using app.yaml.
+Provides:
+    GET  /healthz
+    POST /weather/ask
+    POST /weather/sync
+
+The application uses:
+    - Open-Meteo for weather data
+    - Nominatim for location resolution
+    - Lakebase/PostgreSQL for persistence
+    - pgvector + BM25 for hybrid retrieval
+    - Ollama for local LLM generation
+
+No paid LLM API is required.
 """
+
+from __future__ import annotations
 
 import logging
 import os
-import re
 
-import requests
-from databricks.sdk import WorkspaceClient
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, request
 
 import lakebase
-from sentence_transformers import SentenceTransformer
 import rag_service
 import weather_client
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
 
-app = Flask(__name__)
-_w = WorkspaceClient()
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
+logging.basicConfig(
+    level=logging.INFO
+)
 
+logger = logging.getLogger(
+    "weather-rag"
+)
 
-
-
-
-def _current_user_email() -> str:
-    """
-    Resolve the current user's email so the watchlist can be personalized.
-
-    Databricks Apps inject the logged-in user's identity via the
-    X-Forwarded-Email header on every request. Fall back to the Databricks
-    SDK's current_user API for local development where that header isn't set.
-    """
-    header_email = request.headers.get("X-Forwarded-Email")
-    if header_email:
-        return header_email
-    return _w.current_user.me().user_name
+app = Flask(
+    __name__
+)
 
 
-# Load the embedding model once at module import for weather search
-WEATHER_EMBEDDING_MODEL = os.environ.get("WEATHER_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-WEATHER_EMBEDDING_MODEL_INSTANCE = SentenceTransformer(WEATHER_EMBEDDING_MODEL)
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
-
-@app.route("/healthz")
+@app.route(
+    "/healthz",
+    methods=["GET"],
+)
 def healthz():
-    return jsonify({"status": "ok"})
+    """
+    Basic application health check.
+    """
+
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "indian-weather-rag",
+        }
+    )
 
 
-@app.errorhandler(Exception)
-def handle_exception(err):
-    """Ensure all unhandled errors return JSON (not an HTML error page),
-    so the frontend's resp.json() call never chokes on HTML."""
-    logger.exception("Unhandled exception while processing request")
-    status_code = getattr(err, "code", 500)
-    if not isinstance(status_code, int):
-        status_code = 500
-    return jsonify({"error": str(err)}), status_code
+# ---------------------------------------------------------------------------
+# Weather RAG
+# ---------------------------------------------------------------------------
 
-
-@app.route("/")
-def index():
-    """Simple UI to submit a list of stock symbols to sync from Massive."""
-    return render_template("index.html")
-
-
-@app.route("/records")
-def list_records():
-    return jsonify({"error": "Records endpoint removed (Massive/news features cleaned)."}), 404
-
-
-@app.route("/sync", methods=["POST"])
-def sync_from_massive():
-    return jsonify({"error": "Massive sync removed."}), 404
-
-
-@app.route("/news/sync", methods=["POST"])
-def sync_news_from_massive():
-    return jsonify({"error": "News sync removed."}), 404
-
-
-@app.route("/weather/search", methods=["POST"])
-def weather_search():
-@app.route("/weather/ask", methods=["POST"])
+@app.route(
+    "/weather/ask",
+    methods=["POST"],
+)
 def weather_ask():
-    body = request.json if request.is_json else {}
+    """
+    Ask a weather question using the hybrid RAG pipeline.
 
-    query = body.get("query")
+    Request:
 
-    if not query or not isinstance(query, str):
+        {
+            "query": "Will it rain in Kolkata tomorrow?",
+            "top_k": 5
+        }
+
+    Response:
+
+        {
+            "answer": "...",
+            "sources": [...],
+            "retrieved_documents": 5,
+            "model": "llama3.2:3b",
+            "retrieval": "hybrid"
+        }
+    """
+
+    body = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    query = body.get(
+        "query"
+    )
+
+    if not query or not isinstance(
+        query,
+        str,
+    ):
         return jsonify(
-            {"error": "Missing or invalid 'query' in request body"}
+            {
+                "error": (
+                    "Missing or invalid "
+                    "'query' in request body"
+                )
+            }
+        ), 400
+
+    query = query.strip()
+
+    if not query:
+        return jsonify(
+            {
+                "error": (
+                    "Query cannot be empty"
+                )
+            }
         ), 400
 
     try:
-        top_k = int(body.get("top_k", 5))
-    except (TypeError, ValueError):
-        return jsonify(
-            {"error": "'top_k' must be an integer"}
-        ), 400
 
-    top_k = max(1, min(20, top_k))
-
-    try:
-        result = rag_service.answer_weather_question(
-            query=query,
-            top_k=top_k,
+        top_k = int(
+            body.get(
+                "top_k",
+                5,
+            )
         )
 
-        return jsonify(result)
-
-    except Exception as exc:
-        logger.exception("Weather RAG request failed")
+    except (
+        TypeError,
+        ValueError,
+    ):
 
         return jsonify(
             {
-                "error": "Failed to generate weather answer",
+                "error": (
+                    "'top_k' must be "
+                    "an integer"
+                )
+            }
+        ), 400
+
+    top_k = max(
+        1,
+        min(
+            20,
+            top_k,
+        ),
+    )
+
+    try:
+
+        result = (
+            rag_service
+            .answer_weather_question(
+                query=query,
+                top_k=top_k,
+            )
+        )
+
+        return jsonify(
+            result
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Weather RAG request failed"
+        )
+
+        return jsonify(
+            {
+                "error": (
+                    "Failed to generate "
+                    "weather answer"
+                ),
                 "details": str(exc),
             }
         ), 500
-    """Semantic search over ingested weather documents.
 
-    Body: {"query": "flash flood risk this weekend", "limit": 5}
+
+# ---------------------------------------------------------------------------
+# Weather ingestion
+# ---------------------------------------------------------------------------
+
+@app.route(
+    "/weather/sync",
+    methods=["POST"],
+)
+def weather_sync():
     """
-    body = request.json if request.is_json else {}
-    query_text = body.get("query")
-    if not query_text:
-        return jsonify({"error": "Missing 'query' in request body"}), 400
+    Fetch and store weather data for Indian locations.
 
-    top_k = int(body.get("top_k", body.get("limit", 5)))
-    # clamp
-    top_k = max(1, min(20, top_k))
+    Request:
 
-    vec = WEATHER_EMBEDDING_MODEL_INSTANCE.encode([query_text], show_progress_bar=False)[0].tolist()
-    qvec_literal = "[" + ",".join(map(lambda x: repr(float(x)), vec)) + "]"
+        {
+            "locations": [
+                "Kolkata",
+                "Delhi",
+                "Mumbai"
+            ]
+        }
+    """
 
-    sql = (
-        "SELECT d.id AS document_id, d.location AS location, d.source_type AS source_type, d.headline AS headline, "
-        "e.chunk_text, (e.embedding <=> %s::vector) AS distance "
-        "FROM weather_embeddings e JOIN weather_documents d ON d.id = e.document_id "
-        "ORDER BY distance ASC LIMIT %s"
+    body = (
+        request.get_json(
+            silent=True
+        )
+        or {}
     )
 
-    rows = lakebase.run_query(sql, (qvec_literal, top_k))
-    # Convert distance -> similarity (1 - distance) for cosine distance
-    results = []
-    for r in rows:
-        dist = r.get("distance")
-        similarity = None if dist is None else 1.0 - float(dist)
-        results.append(
+    locations = body.get(
+        "locations"
+    )
+
+    if (
+        not isinstance(
+            locations,
+            list,
+        )
+        or not locations
+    ):
+        return jsonify(
             {
-                "document_id": r.get("document_id"),
-                "location": r.get("location"),
-                "source_type": r.get("source_type"),
-                "headline": r.get("headline"),
-                "chunk_text": r.get("chunk_text"),
-                "similarity": similarity,
+                "error": (
+                    "Missing or invalid "
+                    "'locations' list"
+                )
+            }
+        ), 400
+
+    cleaned_locations = []
+
+    for location in locations:
+
+        if not isinstance(
+            location,
+            str,
+        ):
+            continue
+
+        location = location.strip()
+
+        if location:
+            cleaned_locations.append(
+                location
+            )
+
+    if not cleaned_locations:
+
+        return jsonify(
+            {
+                "error": (
+                    "No valid locations "
+                    "were provided"
+                )
+            }
+        ), 400
+
+    try:
+
+        # Ensure database schema exists.
+        lakebase.ensure_weather_tables(
+            embedding_dim=384
+        )
+
+        synced = (
+            weather_client
+            .sync_locations(
+                cleaned_locations
+            )
+        )
+
+        return jsonify(
+            {
+                "status": "success",
+                "synced": synced,
+                "locations": (
+                    cleaned_locations
+                ),
             }
         )
-    return jsonify(results)
+
+    except Exception as exc:
+
+        logger.exception(
+            "Weather synchronization failed"
+        )
+
+        return jsonify(
+            {
+                "error": (
+                    "Weather synchronization "
+                    "failed"
+                ),
+                "details": str(exc),
+            }
+        ), 500
 
 
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
 
-@app.route("/weather/sync", methods=["POST"])
-def weather_sync():
-    """Trigger syncing of weather docs for a list of locations.
-
-    Body: {"locations": ["Chicago, IL", "40.7128,-74.0060"], "limit": 50}
+@app.errorhandler(404)
+def not_found(error):
     """
-    body = request.json if request.is_json else {}
-    locations = body.get("locations") or []
-    if not isinstance(locations, list) or not locations:
-        return jsonify({"error": "Missing or invalid 'locations' list in request body"}), 400
-
-    limit = int(body.get("limit", 50))
-    # ensure tables exist
-    lakebase.ensure_weather_tables(embedding_dim=384)
-    synced = weather_client.sync_locations(locations, limit=limit)
-    return jsonify({"synced": synced, "locations": locations})
-
-
-@app.route("/watchlist", methods=["GET", "POST", "DELETE"])
-def watchlist_removed():
-    return jsonify({"error": "Watchlist/Massive features removed."}), 404
-
-
-
-
-
-def _upsert_batch(items: list[dict]) -> int:
-    """Upsert a batch of Massive API items into Lakebase, one statement per row.
-
-    For very large batches, consider psycopg2.extras.execute_values for
-    higher throughput instead of per-row execute calls.
+    Return JSON instead of Flask's HTML 404 page.
     """
-    import json as _json
 
-    count = 0
-    # Massive batch upsert removed. This helper is deprecated.
-    return 0
-
-
-def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
-    # Deprecated: news upsert removed from this project
-    return 0
+    return jsonify(
+        {
+            "error": "Endpoint not found",
+        }
+    ), 404
 
 
-if __name__ == '__main__':
-    host = os.getenv('FLASK_RUN_HOST', '0.0.0.0')
-    port = int(os.getenv('FLASK_RUN_PORT', 8000))
-    app.run(debug=True, host=host, port=port)
-    print(f"Flask app running on http://{host}:{port}")
+@app.errorhandler(405)
+def method_not_allowed(error):
+    """
+    Return JSON instead of Flask's HTML 405 page.
+    """
+
+    return jsonify(
+        {
+            "error": "Method not allowed",
+        }
+    ), 405
+
+
+@app.errorhandler(Exception)
+def handle_exception(error):
+    """
+    Catch unexpected application errors.
+    """
+
+    logger.exception(
+        "Unhandled application error"
+    )
+
+    return jsonify(
+        {
+            "error": "Internal server error",
+            "details": str(error),
+        }
+    ), 500
+
+
+# ---------------------------------------------------------------------------
+# Local execution
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    host = os.getenv(
+        "FLASK_RUN_HOST",
+        "0.0.0.0",
+    )
+
+    port = int(
+        os.getenv(
+            "FLASK_RUN_PORT",
+            "8000",
+        )
+    )
+
+    app.run(
+        debug=True,
+        host=host,
+        port=port,
+    )
