@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Weather RAG Search</title>
+  <style>
+    :root {
+      --bg: #f0f4f8;
+      --card-bg: #ffffff;
+      --border: #d1dce6;
+      --text: #1a2332;
+      --muted: #5a6c7d;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --success: #059669;
+      --success-hover: #047857;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      max-width: 900px;
+      margin: 48px auto;
+      padding: 0 24px;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    h1 {
+      font-size: 32px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: var(--accent);
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 16px;
+      margin-top: 4px;
+      line-height: 1.6;
+      margin-bottom: 32px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      margin-bottom: 24px;
+      box-shadow: 0 2px 8px rgba(16, 24, 40, 0.06);
+    }
+
+    .card h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0 0 16px 0;
+      color: var(--text);
+    }
+
+    label {
+      display: block;
+      margin-top: 16px;
+      font-weight: 600;
+      font-size: 14px;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+    label:first-child { margin-top: 0; }
+
+    input[type="text"],
+    textarea {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 15px;
+      font-family: inherit;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    input[type="text"]:focus,
+    textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 60px;
+    }
+
+    button {
+      margin-top: 16px;
+      padding: 12px 24px;
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      transition: background 0.15s ease, transform 0.1s ease;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:active { transform: translateY(1px); }
+
+    button.success {
+      background: var(--success);
+    }
+    button.success:hover { background: var(--success-hover); }
+
+    .status {
+      margin-top: 16px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .status.info {
+      background: #e0f2fe;
+      color: #075985;
+      border: 1px solid #bae6fd;
+    }
+    .status.success {
+      background: #d1fae5;
+      color: #065f46;
+      border: 1px solid #6ee7b7;
+    }
+    .status.error {
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fca5a5;
+    }
+    .status:empty { display: none; }
+
+    .result-card {
+      background: #f9fafb;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 16px;
+      transition: box-shadow 0.2s ease;
+    }
+    .result-card:hover {
+      box-shadow: 0 4px 12px rgba(16, 24, 40, 0.08);
+    }
+    .result-card:last-child { margin-bottom: 0; }
+
+    .result-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .result-location {
+      font-weight: 700;
+      font-size: 16px;
+      color: var(--accent);
+      margin: 0;
+    }
+
+    .result-score {
+      background: var(--accent);
+      color: white;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .result-meta {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .result-headline {
+      font-weight: 600;
+      font-size: 15px;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+
+    .result-text {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--text);
+      margin: 0;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 48px 20px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 640px) {
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>Weather RAG Search</h1>
+  <p class="subtitle">Search weather documents using natural language queries and sync weather data from multiple locations.</p>
+
+  <!-- Weather Search -->
+  <div class="card">
+    <h2>Search Weather Data</h2>
+    <form id="search-form">
+      <label for="query">Enter your weather question</label>
+      <input 
+        type="text" 
+        id="query" 
+        name="query" 
+        placeholder="e.g., flash flood risk this weekend, heavy rain forecast" 
+        required
+      >
+      <div class="two-col">
+        <div>
+          <label for="limit">Number of results</label>
+          <input type="text" id="limit" name="limit" value="5" placeholder="5">
+        </div>
+      </div>
+      <button type="submit">Search</button>
+    </form>
+    <div id="search-status" class="status"></div>
+  </div>
+
+  <!-- Search Results -->
+  <div class="card" id="results-container" style="display: none;">
+    <h2>Search Results</h2>
+    <div id="results"></div>
+  </div>
+
+  <!-- Weather Sync -->
+  <div class="card">
+    <h2>Sync Weather Data</h2>
+    <form id="sync-form">
+      <label for="locations">Locations (comma-separated)</label>
+      <textarea 
+        id="locations" 
+        name="locations" 
+        placeholder="Chicago, IL&#10;New York, NY&#10;40.7128,-74.0060" 
+        rows="4"
+        required
+      ></textarea>
+      <div class="two-col">
+        <div>
+          <label for="sync-limit">Documents per location</label>
+          <input type="text" id="sync-limit" name="sync-limit" value="50" placeholder="50">
+        </div>
+      </div>
+      <button type="submit" class="success">Sync Weather Data</button>
+    </form>
+    <div id="sync-status" class="status"></div>
+  </div>
+
+  <script>
+    const searchForm = document.getElementById("search-form");
+    const syncForm = document.getElementById("sync-form");
+    const searchStatusEl = document.getElementById("search-status");
+    const syncStatusEl = document.getElementById("sync-status");
+    const resultsContainer = document.getElementById("results-container");
+    const resultsEl = document.getElementById("results");
+
+    function showStatus(element, message, type) {
+      element.textContent = message;
+      element.className = `status ${type}`;
+    }
+
+    function clearStatus(element) {
+      element.textContent = "";
+      element.className = "status";
+    }
+
+    // Search form handler
+    searchForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = document.getElementById("query").value.trim();
+      const limit = parseInt(document.getElementById("limit").value) || 5;
+
+      showStatus(searchStatusEl, "Searching...", "info");
+      resultsContainer.style.display = "none";
+
+      try {
+        const resp = await fetch("/weather/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, limit }),
+        });
+        
+        const data = await resp.json();
+        
+        if (!resp.ok) {
+          showStatus(searchStatusEl, `Error: ${data.error || resp.statusText}`, "error");
+          return;
+        }
+
+        clearStatus(searchStatusEl);
+        displayResults(data);
+        
+      } catch (err) {
+        showStatus(searchStatusEl, `Request failed: ${err}`, "error");
+      }
+    });
+
+    // Sync form handler
+    syncForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const locationsText = document.getElementById("locations").value.trim();
+      const limit = parseInt(document.getElementById("sync-limit").value) || 50;
+      
+      const locations = locationsText
+        .split("\n")
+        .map(l => l.trim())
+        .filter(l => l.length > 0);
+
+      if (!locations.length) {
+        showStatus(syncStatusEl, "Please enter at least one location.", "error");
+        return;
+      }
+
+      showStatus(syncStatusEl, `Syncing weather data for ${locations.length} location(s)...`, "info");
+
+      try {
+        const resp = await fetch("/weather/sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ locations, limit }),
+        });
+        
+        const data = await resp.json();
+        
+        if (!resp.ok) {
+          showStatus(syncStatusEl, `Error: ${data.error || resp.statusText}`, "error");
+          return;
+        }
+
+        showStatus(
+          syncStatusEl, 
+          `✓ Successfully synced ${data.synced} document(s) for ${data.locations.length} location(s).`, 
+          "success"
+        );
+        
+      } catch (err) {
+        showStatus(syncStatusEl, `Request failed: ${err}`, "error");
+      }
+    });
+
+    function displayResults(results) {
+      resultsEl.innerHTML = "";
+
+      if (!results || !results.length) {
+        resultsEl.innerHTML = `
+          <div class="empty-state">
+            No results found. Try a different query or sync weather data first.
+          </div>
+        `;
+        resultsContainer.style.display = "block";
+        return;
+      }
+
+      results.forEach((result) => {
+        const card = document.createElement("div");
+        card.className = "result-card";
+        
+        const similarity = result.similarity !== null && result.similarity !== undefined
+          ? (result.similarity * 100).toFixed(1) + "%"
+          : "N/A";
+
+        card.innerHTML = `
+          <div class="result-header">
+            <h3 class="result-location">${escapeHtml(result.location || "Unknown")}</h3>
+            <span class="result-score">${similarity}</span>
+          </div>
+          <div class="result-meta">
+            <strong>Source:</strong> ${escapeHtml(result.source_type || "N/A")} | 
+            <strong>Document ID:</strong> ${result.document_id || "N/A"}
+          </div>
+          ${result.headline ? `<div class="result-headline">${escapeHtml(result.headline)}</div>` : ""}
+          <p class="result-text">${escapeHtml(result.chunk_text || "No content available")}</p>
+        `;
+        
+        resultsEl.appendChild(card);
+      });
+
+      resultsContainer.style.display = "block";
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>

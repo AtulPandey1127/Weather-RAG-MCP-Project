@@ -1,1 +1,2 @@
-# Weather-RAG-MCP-Project
+# weather-rag
+Vector Weather Retrieval Service
