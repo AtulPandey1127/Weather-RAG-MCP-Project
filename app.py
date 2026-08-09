@@ -19,6 +19,7 @@ from flask import Flask, jsonify, render_template, request
 
 import lakebase
 from sentence_transformers import SentenceTransformer
+import rag_service
 import weather_client
 
 logging.basicConfig(level=logging.INFO)
