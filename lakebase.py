@@ -1,16 +1,13 @@
 """
 Lakebase (Databricks-managed Postgres) connection helper.
 
-Connects using a single LAKEBASE_URL stored in a Databricks
-secret scope.
+Databricks authentication is initialized lazily so that the application
+can start locally without Lakebase credentials.
 
-The database contains:
-    - weather_documents
-    - weather_embeddings
-
-The weather_documents table stores structured Indian-weather
-metadata for metadata filtering and RAG retrieval.
+Lakebase credentials are only required when a database operation is used.
 """
+
+from __future__ import annotations
 
 import base64
 import os
@@ -21,12 +18,6 @@ from databricks.sdk import WorkspaceClient
 from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 
-
-# ---------------------------------------------------------------------------
-# Databricks / Lakebase configuration
-# ---------------------------------------------------------------------------
-
-_w = WorkspaceClient()
 
 _SCOPE = os.environ.get(
     "LAKEBASE_SECRET_SCOPE",
@@ -40,16 +31,38 @@ _KEY = os.environ.get(
 
 
 # ---------------------------------------------------------------------------
-# Connection
+# Lazy Databricks client
+# ---------------------------------------------------------------------------
+
+_workspace_client: WorkspaceClient | None = None
+
+
+def _get_workspace_client() -> WorkspaceClient:
+    """
+    Create the Databricks WorkspaceClient only when Lakebase access
+    is actually required.
+    """
+
+    global _workspace_client
+
+    if _workspace_client is None:
+        _workspace_client = WorkspaceClient()
+
+    return _workspace_client
+
+
+# ---------------------------------------------------------------------------
+# Lakebase URL
 # ---------------------------------------------------------------------------
 
 def _lakebase_url() -> str:
     """
-    Fetch and decode the Lakebase PostgreSQL connection URL
-    from the Databricks secret scope.
+    Fetch and decode the Lakebase connection URL from Databricks secrets.
     """
 
-    secret = _w.secrets.get_secret(
+    workspace_client = _get_workspace_client()
+
+    secret = workspace_client.secrets.get_secret(
         scope=_SCOPE,
         key=_KEY,
     )
@@ -59,10 +72,17 @@ def _lakebase_url() -> str:
     ).decode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------------
+
 @contextmanager
 def get_connection():
     """
-    Yield a raw psycopg connection with dict_row factory.
+    Yield a PostgreSQL connection.
+
+    Databricks authentication is triggered only when this function
+    is actually called.
     """
 
     conn = psycopg.connect(
@@ -95,10 +115,7 @@ def run_query(
     params: tuple | dict | None = None,
 ) -> list[dict]:
     """
-    Run a read query against Lakebase.
-
-    Returns:
-        List of rows represented as dictionaries.
+    Execute a read query.
     """
 
     with get_connection() as conn:
@@ -118,10 +135,7 @@ def run_write(
     params: tuple | dict | None = None,
 ) -> int:
     """
-    Run an INSERT/UPDATE/DELETE/DDL statement.
-
-    Returns:
-        Number of affected rows when available.
+    Execute an INSERT/UPDATE/DELETE/DDL statement.
     """
 
     with get_connection() as conn:
@@ -146,23 +160,14 @@ def ensure_weather_tables(
     embedding_dim: int = 384,
 ) -> None:
     """
-    Create and migrate the weather database tables.
+    Create the weather tables and indexes.
 
-    The default embedding dimension is 384 because the project
-    currently uses all-MiniLM-L6-v2.
+    This function requires working Lakebase credentials.
     """
-
-    # -----------------------------------------------------------------------
-    # pgvector
-    # -----------------------------------------------------------------------
 
     run_write(
         "CREATE EXTENSION IF NOT EXISTS vector;"
     )
-
-    # -----------------------------------------------------------------------
-    # Weather documents
-    # -----------------------------------------------------------------------
 
     run_write(
         """
@@ -212,170 +217,121 @@ def ensure_weather_tables(
     )
 
     # -----------------------------------------------------------------------
-    # Migrations for existing installations
-    # -----------------------------------------------------------------------
-    #
-    # CREATE TABLE IF NOT EXISTS does not modify an existing table.
-    # These statements make the schema backward-compatible if the table
-    # already existed using the older weather schema.
+    # Existing-table migrations
     # -----------------------------------------------------------------------
 
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS state TEXT
-        """
-    )
+    migration_columns = [
+        (
+            "state",
+            "TEXT",
+        ),
+        (
+            "district",
+            "TEXT",
+        ),
+        (
+            "latitude",
+            "DOUBLE PRECISION",
+        ),
+        (
+            "longitude",
+            "DOUBLE PRECISION",
+        ),
+        (
+            "source",
+            "TEXT DEFAULT 'open-meteo'",
+        ),
+        (
+            "forecast_date",
+            "DATE",
+        ),
+        (
+            "temperature_min_c",
+            "DOUBLE PRECISION",
+        ),
+        (
+            "temperature_max_c",
+            "DOUBLE PRECISION",
+        ),
+        (
+            "rainfall_mm",
+            "DOUBLE PRECISION",
+        ),
+        (
+            "precipitation_probability",
+            "DOUBLE PRECISION",
+        ),
+        (
+            "weather_code",
+            "INTEGER",
+        ),
+        (
+            "severity",
+            "TEXT",
+        ),
+    ]
 
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS district TEXT
-        """
-    )
+    for column_name, column_type in migration_columns:
 
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'open-meteo'
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS forecast_date DATE
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS temperature_min_c DOUBLE PRECISION
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS temperature_max_c DOUBLE PRECISION
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS rainfall_mm DOUBLE PRECISION
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS precipitation_probability DOUBLE PRECISION
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS weather_code INTEGER
-        """
-    )
-
-    run_write(
-        """
-        ALTER TABLE weather_documents
-        ADD COLUMN IF NOT EXISTS severity TEXT
-        """
-    )
-
-    # -----------------------------------------------------------------------
-    # Weather document indexes
-    # -----------------------------------------------------------------------
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_location
-        ON weather_documents (location)
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_state
-        ON weather_documents (state)
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_district
-        ON weather_documents (district)
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_source
-        ON weather_documents (source)
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_source_type
-        ON weather_documents (source_type)
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_forecast_date
-        ON weather_documents (forecast_date)
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_precipitation_probability
-        ON weather_documents (
-            precipitation_probability
+        run_write(
+            f"""
+            ALTER TABLE weather_documents
+            ADD COLUMN IF NOT EXISTS
+            {column_name} {column_type}
+            """
         )
-        """
-    )
-
-    run_write(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_weather_documents_issued_at
-        ON weather_documents (issued_at)
-        """
-    )
 
     # -----------------------------------------------------------------------
-    # Weather embeddings
+    # Weather indexes
+    # -----------------------------------------------------------------------
+
+    indexes = [
+        (
+            "idx_weather_documents_location",
+            "location",
+        ),
+        (
+            "idx_weather_documents_state",
+            "state",
+        ),
+        (
+            "idx_weather_documents_district",
+            "district",
+        ),
+        (
+            "idx_weather_documents_source",
+            "source",
+        ),
+        (
+            "idx_weather_documents_source_type",
+            "source_type",
+        ),
+        (
+            "idx_weather_documents_forecast_date",
+            "forecast_date",
+        ),
+        (
+            "idx_weather_documents_precipitation_probability",
+            "precipitation_probability",
+        ),
+        (
+            "idx_weather_documents_issued_at",
+            "issued_at",
+        ),
+    ]
+
+    for index_name, column_name in indexes:
+
+        run_write(
+            f"""
+            CREATE INDEX IF NOT EXISTS
+            {index_name}
+            ON weather_documents ({column_name})
+            """
+        )
+
+    # -----------------------------------------------------------------------
+    # Embeddings
     # -----------------------------------------------------------------------
 
     run_write(
@@ -398,10 +354,6 @@ def ensure_weather_tables(
         )
         """
     )
-
-    # -----------------------------------------------------------------------
-    # Embedding indexes
-    # -----------------------------------------------------------------------
 
     run_write(
         """
