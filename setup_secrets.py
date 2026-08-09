@@ -1,43 +1,58 @@
 """
-One-time setup script: creates the Databricks secret scope and stores the
-Massive API key. Run this locally (with the Databricks CLI configured) or
-from a notebook - never commit the resulting secret value anywhere.
+One-time Databricks secret setup.
+
+Only the Lakebase connection URL is stored here.
+Weather APIs used by this project do not require a paid API key.
 
 Usage:
     python setup_secrets.py
+
+Never commit secret values to source control.
 """
+
+from getpass import getpass
+
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import workspace
-import getpass
 
-w = WorkspaceClient()
 
-# w.secrets.create_scope(scope="massive")
-# w.secrets.put_secret(
-#     scope="massive",
-#     key="api-key",
-#     string_value=getpass.getpass("Paste your Massive API key: ")
-# )
+SCOPE = "database"
+KEY = "lakebase-url"
 
-# w.secrets.create_scope(scope="database")
-w.secrets.put_secret(
-    scope="database",
-    key="lakebase-url",
-    string_value=getpass.getpass("Paste your Lakebase URL: ")
-)
 
-# lakebase-url = "
-# postgresql://student:npg_h9WJUmFj5Kal@ep-sparkling-base-d8wb4gaq.database.us-east-2.cloud.databricks.com/databricks_postgres?sslmode=require
-# "
+def main() -> None:
+    workspace_client = WorkspaceClient()
 
-w.secrets.put_acl(
-    scope="database",
-    principal="users",
-    permission=workspace.AclPermission.READ,
-)
+    print("Creating/updating Lakebase secret...")
+    print("The value will not be displayed.")
 
-w.secrets.put_acl(
-    scope="massive",
-    principal="users",
-    permission=workspace.AclPermission.READ,
-)
+    lakebase_url = getpass(
+        "Paste your Lakebase PostgreSQL connection URL: "
+    )
+
+    if not lakebase_url:
+        raise ValueError("Lakebase URL cannot be empty.")
+
+    try:
+        workspace_client.secrets.create_scope(scope=SCOPE)
+        print(f"Created secret scope: {SCOPE}")
+    except Exception:
+        print(f"Using existing secret scope: {SCOPE}")
+
+    workspace_client.secrets.put_secret(
+        scope=SCOPE,
+        key=KEY,
+        string_value=lakebase_url,
+    )
+
+    workspace_client.secrets.put_acl(
+        scope=SCOPE,
+        principal="users",
+        permission=workspace.AclPermission.READ,
+    )
+
+    print("Lakebase secret configured successfully.")
+
+
+if __name__ == "__main__":
+    main()
