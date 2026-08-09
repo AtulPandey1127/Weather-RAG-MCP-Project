@@ -1,8 +1,11 @@
-"""NWS (National Weather Service) helper client for resolving locations,
-fetching alerts and forecasts, and normalizing documents for Lakebase.
+"""
+Indian weather data client.
 
-Usage: call `sync_locations(locations, limit)` to fetch and upsert documents
-into the `weather_documents` table using `lakebase.get_connection()`.
+Uses Open-Meteo for free weather observations and forecasts.
+Locations are resolved through OpenStreetMap Nominatim.
+
+The normalized output is designed for the project's RAG pipeline
+and PostgreSQL/Lakebase weather_documents table.
 """
 
 from __future__ import annotations
@@ -18,182 +21,540 @@ import lakebase
 
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NWS_BASE = "https://api.weather.gov"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+USER_AGENT = "weather-rag-india/1.0"
+
+REQUEST_TIMEOUT = 20
+LOCATION_DELAY_SECONDS = 1
 
 
-def geocode_location(location: str) -> Optional[Tuple[float, float, str]]:
-    """Resolve a free-text `city, state` string to (lat, lon, display_name).
-    Falls back to treating `location` as `lat,lon` if parseable.
+# ---------------------------------------------------------------------------
+# Location resolution
+# ---------------------------------------------------------------------------
+
+def geocode_location(
+    location: str,
+) -> Optional[Tuple[float, float, str]]:
     """
-    # If user passed lat,lon
+    Resolve an Indian city/district to latitude, longitude and display name.
+
+    Also accepts direct coordinates in the form:
+
+        "22.5726,88.3639"
+    """
+
+    location = location.strip()
+
+    # Direct latitude/longitude input
     if "," in location:
-        parts = [p.strip() for p in location.split(",")]
+        parts = [part.strip() for part in location.split(",")]
+
         if len(parts) == 2:
             try:
                 lat = float(parts[0])
                 lon = float(parts[1])
-                return lat, lon, f"{lat},{lon}"
-            except Exception:
+
+                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                    return lat, lon, f"{lat},{lon}"
+
+            except ValueError:
                 pass
 
-    params = {"q": location, "format": "json", "limit": 1}
-    headers = {"User-Agent": "weather-rag/1.0 (email@example.com)"}
-    resp = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data:
+    params = {
+        "q": f"{location}, India",
+        "format": "json",
+        "limit": 1,
+        "countrycodes": "in",
+    }
+
+    headers = {
+        "User-Agent": USER_AGENT,
+    }
+
+    response = requests.get(
+        NOMINATIM_URL,
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    results = response.json()
+
+    if not results:
         return None
-    item = data[0]
-    return float(item["lat"]), float(item["lon"]), item.get("display_name", location)
+
+    result = results[0]
+
+    return (
+        float(result["lat"]),
+        float(result["lon"]),
+        result.get("display_name", location),
+    )
 
 
-def resolve_gridpoint(lat: float, lon: float) -> Optional[Dict]:
-    """Call NWS GET /points/{lat},{lon} to get gridpoint metadata.
-    Returns the JSON object or None on error.
+# ---------------------------------------------------------------------------
+# Open-Meteo
+# ---------------------------------------------------------------------------
+
+def fetch_weather(
+    latitude: float,
+    longitude: float,
+) -> Dict:
     """
-    url = f"{NWS_BASE}/points/{lat},{lon}"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    Fetch current weather and a 7-day forecast.
 
-
-def fetch_alerts_for_point(lat: float, lon: float, limit: int = 50) -> List[Dict]:
-    url = f"{NWS_BASE}/alerts/active"
-    params = {"point": f"{lat},{lon}", "limit": limit}
-    resp = requests.get(url, params=params, timeout=20)
-    resp.raise_for_status()
-    return resp.json().get("features", [])
-
-
-def fetch_forecast_for_grid(grid_json: Dict) -> List[Dict]:
-    """Fetch forecast periods and normalize them into list of features.
-    `grid_json` is the result of GET /points/{lat},{lon}.
+    Open-Meteo does not require an API key.
     """
-    try:
-        props = grid_json.get("properties", {})
-        forecast_url = props.get("forecast")
-        if not forecast_url:
-            return []
-        resp = requests.get(forecast_url, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        periods = data.get("properties", {}).get("periods", [])
-        return periods
-    except Exception:
-        return []
 
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": ",".join(
+            [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "apparent_temperature",
+                "precipitation",
+                "weather_code",
+                "cloud_cover",
+                "wind_speed_10m",
+                "wind_direction_10m",
+            ]
+        ),
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "precipitation_probability",
+                "precipitation",
+                "weather_code",
+                "wind_speed_10m",
+            ]
+        ),
+        "daily": ",".join(
+            [
+                "weather_code",
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "apparent_temperature_max",
+                "apparent_temperature_min",
+                "sunrise",
+                "sunset",
+                "precipitation_sum",
+                "rain_sum",
+                "precipitation_probability_max",
+                "wind_speed_10m_max",
+            ]
+        ),
+        "timezone": "auto",
+        "forecast_days": 7,
+    }
+
+    response = requests.get(
+        OPEN_METEO_URL,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ---------------------------------------------------------------------------
+# Weather code conversion
+# ---------------------------------------------------------------------------
+
+WEATHER_CODES = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snowfall",
+    73: "Moderate snowfall",
+    75: "Heavy snowfall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+
+def weather_description(code: Optional[int]) -> str:
+    """Convert Open-Meteo WMO weather code to readable text."""
+
+    if code is None:
+        return "Unknown"
+
+    return WEATHER_CODES.get(code, "Unknown weather condition")
+
+
+# ---------------------------------------------------------------------------
+# Stable document IDs
+# ---------------------------------------------------------------------------
 
 def _make_id(prefix: str, raw: Dict) -> str:
-    """Stable id for deduplication: hash of canonical fields."""
-    if prefix == "alert":
-        # NWS alert features typically have an 'id' field
-        return raw.get("id") or hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
-    else:
-        # For forecast periods, use start time + gridpoint + short hash
-        key = json.dumps({"name": raw.get("name"), "startTime": raw.get("startTime"), "shortForecast": raw.get("shortForecast")}, sort_keys=True)
-        return hashlib.sha256(key.encode()).hexdigest()
+    """
+    Create a deterministic document ID.
+
+    This allows repeated ingestion without creating duplicates.
+    """
+
+    canonical = json.dumps(
+        {
+            "prefix": prefix,
+            **raw,
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+    return hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
 
 
-def normalize_alert(feature: Dict, location_label: str) -> Dict:
-    props = feature.get("properties", {})
-    doc_id = _make_id("alert", feature)
-    headline = props.get("headline") or props.get("event")
-    narrative = (props.get("description") or "") + "\n\n" + (props.get("instruction") or "")
-    issued = props.get("sent") or props.get("effective") or props.get("onset")
-    return {
-        "id": doc_id,
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+def normalize_current_weather(
+    weather: Dict,
+    location_label: str,
+) -> Dict:
+    """
+    Convert current Open-Meteo weather into a RAG document.
+    """
+
+    current = weather.get("current", {})
+
+    weather_code = current.get("weather_code")
+
+    headline = (
+        f"Current weather in {location_label}"
+    )
+
+    narrative = (
+        f"Current weather for {location_label}. "
+        f"Temperature: {current.get('temperature_2m')} °C. "
+        f"Feels like: {current.get('apparent_temperature')} °C. "
+        f"Humidity: {current.get('relative_humidity_2m')}%. "
+        f"Condition: {weather_description(weather_code)}. "
+        f"Precipitation: {current.get('precipitation')} mm. "
+        f"Cloud cover: {current.get('cloud_cover')}%. "
+        f"Wind speed: {current.get('wind_speed_10m')} km/h. "
+        f"Wind direction: {current.get('wind_direction_10m')}°."
+    )
+
+    raw = {
         "location": location_label,
-        "source_type": "alert",
-        "headline": headline,
-        "narrative_text": narrative.strip(),
-        "issued_at": issued,
-        "payload": feature,
-        "synced_at": None,
+        "source": "open-meteo",
+        "type": "current",
+        "time": current.get("time"),
     }
 
-
-def normalize_forecast(period: Dict, location_label: str) -> Dict:
-    doc_id = _make_id("forecast", period)
-    headline = period.get("name")
-    narrative = period.get("detailedForecast") or period.get("detailedforecast") or period.get("shortForecast")
-    issued = period.get("startTime")
     return {
-        "id": doc_id,
+        "id": _make_id("current", raw),
         "location": location_label,
-        "source_type": "forecast",
+        "source_type": "current",
         "headline": headline,
         "narrative_text": narrative,
-        "issued_at": issued,
-        "payload": period,
+        "issued_at": current.get("time"),
+        "payload": weather,
         "synced_at": None,
     }
 
 
-def upsert_documents(docs: List[Dict]) -> int:
-    """Upsert into weather_documents. Returns number of upserted rows."""
-    if not docs:
-        return 0
-    sql = (
-        "INSERT INTO weather_documents (id, location, source_type, headline, narrative_text, issued_at, payload, synced_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,now()) "
-        "ON CONFLICT (id) DO UPDATE SET narrative_text = EXCLUDED.narrative_text, payload = EXCLUDED.payload, synced_at = now()"
-    )
-    params = []
-    for d in docs:
-        params.append((
-            d.get("id"),
-            d.get("location"),
-            d.get("source_type"),
-            d.get("headline"),
-            d.get("narrative_text"),
-            d.get("issued_at"),
-            json.dumps(d.get("payload") or {}),
-        ))
-
-    with lakebase.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(sql, params)
-            conn.commit()
-            return cur.rowcount
-
-
-def sync_locations(locations: List[str], limit: int = 50) -> int:
-    """Resolve each location, fetch alerts and forecasts, normalize and upsert.
-    Returns total documents synced.
+def normalize_daily_forecasts(
+    weather: Dict,
+    location_label: str,
+) -> List[Dict]:
     """
+    Convert daily Open-Meteo forecasts into individual RAG documents.
+    """
+
+    daily = weather.get("daily", {})
+
+    dates = daily.get("time", [])
+
+    documents = []
+
+    for index, date in enumerate(dates):
+
+        weather_code = _get_index(
+            daily.get("weather_code"),
+            index,
+        )
+
+        max_temp = _get_index(
+            daily.get("temperature_2m_max"),
+            index,
+        )
+
+        min_temp = _get_index(
+            daily.get("temperature_2m_min"),
+            index,
+        )
+
+        precipitation = _get_index(
+            daily.get("precipitation_sum"),
+            index,
+        )
+
+        rain = _get_index(
+            daily.get("rain_sum"),
+            index,
+        )
+
+        precipitation_probability = _get_index(
+            daily.get("precipitation_probability_max"),
+            index,
+        )
+
+        wind = _get_index(
+            daily.get("wind_speed_10m_max"),
+            index,
+        )
+
+        condition = weather_description(weather_code)
+
+        headline = (
+            f"Weather forecast for {location_label} on {date}"
+        )
+
+        narrative = (
+            f"Weather forecast for {location_label} on {date}. "
+            f"Condition: {condition}. "
+            f"Minimum temperature: {min_temp} °C. "
+            f"Maximum temperature: {max_temp} °C. "
+            f"Total precipitation: {precipitation} mm. "
+            f"Rainfall: {rain} mm. "
+            f"Maximum precipitation probability: "
+            f"{precipitation_probability}%. "
+            f"Maximum wind speed: {wind} km/h."
+        )
+
+        raw = {
+            "location": location_label,
+            "date": date,
+            "type": "daily_forecast",
+        }
+
+        documents.append(
+            {
+                "id": _make_id("forecast", raw),
+                "location": location_label,
+                "source_type": "forecast",
+                "headline": headline,
+                "narrative_text": narrative,
+                "issued_at": date,
+                "payload": {
+                    "date": date,
+                    "weather_code": weather_code,
+                    "condition": condition,
+                    "temperature_min_c": min_temp,
+                    "temperature_max_c": max_temp,
+                    "precipitation_mm": precipitation,
+                    "rain_mm": rain,
+                    "precipitation_probability": precipitation_probability,
+                    "max_wind_speed_kmh": wind,
+                },
+                "synced_at": None,
+            }
+        )
+
+    return documents
+
+
+def _get_index(
+    values: Optional[List],
+    index: int,
+):
+    """Safely retrieve a list value."""
+
+    if not values or index >= len(values):
+        return None
+
+    return values[index]
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def upsert_documents(
+    documents: List[Dict],
+) -> int:
+    """
+    Upsert normalized weather documents into PostgreSQL/Lakebase.
+    """
+
+    if not documents:
+        return 0
+
+    sql = """
+        INSERT INTO weather_documents (
+            id,
+            location,
+            source_type,
+            headline,
+            narrative_text,
+            issued_at,
+            payload,
+            synced_at
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            now()
+        )
+        ON CONFLICT (id)
+        DO UPDATE SET
+            location = EXCLUDED.location,
+            source_type = EXCLUDED.source_type,
+            headline = EXCLUDED.headline,
+            narrative_text = EXCLUDED.narrative_text,
+            issued_at = EXCLUDED.issued_at,
+            payload = EXCLUDED.payload,
+            synced_at = now()
+    """
+
+    params = []
+
+    for document in documents:
+        params.append(
+            (
+                document.get("id"),
+                document.get("location"),
+                document.get("source_type"),
+                document.get("headline"),
+                document.get("narrative_text"),
+                document.get("issued_at"),
+                json.dumps(
+                    document.get("payload") or {},
+                    default=str,
+                ),
+            )
+        )
+
+    with lakebase.get_connection() as connection:
+        with connection.cursor() as cursor:
+
+            cursor.executemany(
+                sql,
+                params,
+            )
+
+            connection.commit()
+
+            return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Main ingestion pipeline
+# ---------------------------------------------------------------------------
+
+def sync_locations(
+    locations: List[str],
+    limit: int = 50,
+) -> int:
+    """
+    Fetch and store weather data for Indian locations.
+
+    `limit` is retained for backward compatibility with the
+    previous NWS implementation.
+    """
+
+    del limit
+
     total = 0
-    for loc in locations:
-        resolved = None
-        try:
-            resolved = geocode_location(loc)
-        except Exception:
-            resolved = None
-        if not resolved:
-            continue
-        lat, lon, label = resolved
-        try:
-            grid = resolve_gridpoint(lat, lon)
-        except Exception:
-            grid = None
 
-        # Fetch alerts
-        try:
-            alerts = fetch_alerts_for_point(lat, lon, limit=limit)
-        except Exception:
-            alerts = []
-        norm_alerts = [normalize_alert(a, label) for a in alerts]
+    for location in locations:
 
-        # Fetch forecast periods
-        periods = []
         try:
-            periods = fetch_forecast_for_grid(grid) if grid else []
-        except Exception:
-            periods = []
-        norm_periods = [normalize_forecast(p, label) for p in periods]
+            resolved = geocode_location(location)
 
-        count = upsert_documents(norm_alerts + norm_periods)
-        total += count
-        # be nice to the NWS API
-        time.sleep(1)
+            if not resolved:
+                print(
+                    f"Could not resolve location: {location}"
+                )
+                continue
+
+            latitude, longitude, label = resolved
+
+            print(
+                f"Fetching weather for {label} "
+                f"({latitude}, {longitude})"
+            )
+
+            weather = fetch_weather(
+                latitude,
+                longitude,
+            )
+
+            documents = []
+
+            documents.append(
+                normalize_current_weather(
+                    weather,
+                    label,
+                )
+            )
+
+            documents.extend(
+                normalize_daily_forecasts(
+                    weather,
+                    label,
+                )
+            )
+
+            count = upsert_documents(documents)
+
+            total += count
+
+            print(
+                f"Synced {count} documents for {label}"
+            )
+
+        except requests.RequestException as exc:
+
+            print(
+                f"Weather API error for "
+                f"{location}: {exc}"
+            )
+
+        except Exception as exc:
+
+            print(
+                f"Unexpected error for "
+                f"{location}: {exc}"
+            )
+
+        # Respect Nominatim/Open-Meteo usage.
+        time.sleep(LOCATION_DELAY_SECONDS)
 
     return total
